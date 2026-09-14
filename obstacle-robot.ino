@@ -1,22 +1,21 @@
 // ============================================================================
-//  Obstacle Avoiding Robot — v15 (stutter-loop + glitch fixes)
+//  Obstacle Avoiding Robot — v16 (stable cruise + double-ping debounce)
 //  HW: Uno + HC-SR04(TRIG11,ECHO12) + Servo(3) + L298N(ENA5,7,8 ENB6,9,10) + 4WD + 3S 11.1V
 //
-//  FIXES APPLIED (v15):
-//    1. AVOID_DECIDE NEVER chooses front: this state is only reached after BLOCKED,
-//       so going straight would re-hit the obstacle (infinite stutter loop).
-//       Strictly distL vs distR → -1 (left) or 1 (right), whichever has clearance.
-//    2. CRUISE trigger is now (d > 4 && d <= STOP_CM): readings ≤ 4 cm are floor
-//       reflection glitches and are ignored. STOP_CM raised 20 → 28 for 4WD
-//       stopping distance. Timeout/no-echo still normalizes to 400 (clear).
-//    3. AVOID_TURN cleaned: dead front shortcut removed (unreachable now), pivot
-//       always runs the full TURN_MS (650ms) before forward motion resumes.
-//    (v14 fixes retained: 400-on-timeout, PWM 190/180/190, stateStart stamps.)
+//  FIXES APPLIED (v16):
+//    1. PING_INTERVAL 50→80ms to avoid overlapping ultrasonic echoes (stable cruise).
+//    2. CRUISE obstacle confirmation: require 2 consecutive pings with
+//       (d > 4 && d <= STOP_CM) before AVOID_STOP. Single glitch no longer stops
+//       the car. Clear ping (d > STOP_CM or 400) resets counter to 0.
+//       STOP_CM stays 28, floor glitches ≤4 cm still ignored. PWM stays 190/180/190.
+//    3. Avoidance stays clean: stop 300ms → reverse 400ms → scan L/R → pivot to
+//       greater clearance → escape forward → CRUISE. TURN_MS stays 650ms solid pivot.
+//    (v15 fixes retained: AVOID_DECIDE never picks front, 400-on-timeout, stamps.)
 //
 //  BEHAVIOR:
 //    STARTUP: scan L/F/R → turn to best → cruise
-//    CRUISE:  drive forward + ping front every 50ms (nothing else)
-//    BLOCKED: stop → reverse → scan L/R → pivot LEFT or RIGHT 90° → escape → cruise
+//    CRUISE:  drive forward + ping every 80ms, debounce 2× before blocking
+//    BLOCKED: stop → reverse → scan L/R → pivot LEFT/RIGHT 90° → escape → cruise
 // ============================================================================
 
 #include <Servo.h>
@@ -46,7 +45,7 @@
 #define REV_MS        400    // reverse time
 #define ESCAPE_MS     500    // forward escape after turn
 #define SCAN_SETTLE   450    // servo settle at extremes
-#define PING_INTERVAL  50    // ms between front pings during cruise
+#define PING_INTERVAL  80    // ms between front pings during cruise (v16: 50→80 to avoid echo overlap)
 #define SERVO_LEFT   160
 #define SERVO_RIGHT   25
 #define SERVO_CENTER  90
@@ -162,6 +161,7 @@ uint32_t stateStart = 0;    // when we entered current state
 uint32_t lastPing = 0;      // last front ping time
 int avoidDir = 0;           // -1 left, 1 right (DECIDE never picks 0/front — see v15 fix)
 int distL = 0, distR = 0, distF = 0;
+uint8_t blockHits = 0;      // v16: consecutive blocked pings in CRUISE (need 2× to trigger)
 
 // ============================================================================
 //  SETUP
@@ -173,7 +173,7 @@ void setup() {
   servo_init();
   delay(600);  // one-time servo power-up settle
 
-  Serial.println(F("=== ROBOT v15 fixed ==="));
+  Serial.println(F("=== ROBOT v16 fixed ==="));
 
   // Startup: scan L/F/R (sensor returns 400 = clear on timeout)
   servo_lookLeft();  delay(SCAN_SETTLE); distL = sensor_ping_median();
@@ -211,20 +211,28 @@ void loop() {
 
   switch (state) {
 
-    // ── CRUISE: ping front, motor stays ON ──────────────────────────────
+    // ── CRUISE: ping front, motor stays ON — v16 double-ping debounce ──
     case CRUISE: {
-      if (now - lastPing < PING_INTERVAL) return;  // not time yet
+      if (now - lastPing < PING_INTERVAL) return;  // not time yet (80ms)
       lastPing = now;
       int d = sensor_ping();
       if (d == 0) d = CLEAR_CM;  // defensive: 0 = timeout → clear (sensor_ping already returns 400)
       Serial.print(F("front ")); Serial.println(d);
-      // FIX v15: only a real echo in (4, STOP_CM] blocks. ≤4 cm = floor glitch, ignore.
-      // 400 (timeout) can never satisfy d <= STOP_CM, so open space keeps driving.
+      // v16: require 2 consecutive pings in (4, STOP_CM] before blocking.
+      // Single stray echo no longer interrupts cruise. Clear ping resets counter.
       if (d > 4 && d <= STOP_CM) {
-        Serial.print(F("BLOCKED d=")); Serial.println(d);
-        motors_stop();
-        stateStart = now;   // FIX #4: stamp exit from CRUISE
-        state = AVOID_STOP;
+        blockHits++;
+        Serial.print(F("hit ")); Serial.print(blockHits); Serial.println(F("/2"));
+        if (blockHits >= 2) {
+          Serial.print(F("BLOCKED d=")); Serial.println(d);
+          motors_stop();
+          blockHits = 0;
+          stateStart = now;
+          state = AVOID_STOP;
+        }
+      } else {
+        if (blockHits != 0) Serial.println(F("clear -> reset hits"));
+        blockHits = 0;  // clear reading (d > STOP_CM or 400 or ≤4 glitch) → reset
       }
       // else: motor keeps running (motors_forward was called before entering CRUISE)
       break;
@@ -336,7 +344,8 @@ void loop() {
     case AVOID_ESCAPE:
       if (now - stateStart >= 150) {  // small settle after stop
         motors_forward(SPEED_CRUISE);
-        stateStart = now;   // FIX #4: stamp exit from ESCAPE
+        blockHits = 0;      // v16: fresh debounce window on re-enter CRUISE
+        stateStart = now;
         state = CRUISE;
         lastPing = now;
       }
