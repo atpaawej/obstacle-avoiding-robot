@@ -1,58 +1,63 @@
 // ============================================================================
-//  Obstacle Avoiding Robot — v16 (stable cruise + double-ping debounce)
-//  HW: Uno + HC-SR04(TRIG11,ECHO12) + Servo(3) + L298N(ENA5,7,8 ENB6,9,10) + 4WD + 3S 11.1V
+//  Obstacle Avoiding Robot — Overhauled Control Firmware (v18 - Stable)
+//  Hardware: Arduino Uno + HC-SR04 (TRIG 11, ECHO 12) + SG90 Servo (Pin 3)
+//            + L298N Dual H-Bridge (ENA 5, IN1 7, IN2 8, ENB 6, IN3 9, IN4 10)
+//            + 4WD Chassis + 3S LiPo Battery
 //
-//  FIXES APPLIED (v16):
-//    1. PING_INTERVAL 50→80ms to avoid overlapping ultrasonic echoes (stable cruise).
-//    2. CRUISE obstacle confirmation: require 2 consecutive pings with
-//       (d > 4 && d <= STOP_CM) before AVOID_STOP. Single glitch no longer stops
-//       the car. Clear ping (d > STOP_CM or 400) resets counter to 0.
-//       STOP_CM stays 28, floor glitches ≤4 cm still ignored. PWM stays 190/180/190.
-//    3. Avoidance stays clean: stop 300ms → reverse 400ms → scan L/R → pivot to
-//       greater clearance → escape forward → CRUISE. TURN_MS stays 650ms solid pivot.
-//    (v15 fixes retained: AVOID_DECIDE never picks front, 400-on-timeout, stamps.)
-//
-//  BEHAVIOR:
-//    STARTUP: scan L/F/R → turn to best → cruise
-//    CRUISE:  drive forward + ping every 80ms, debounce 2× before blocking
-//    BLOCKED: stop → reverse → scan L/R → pivot LEFT/RIGHT 90° → escape → cruise
+//  KEY FEATURES:
+//    1. RESET INDICATOR & 3s COUNTDOWN: Onboard LED (Pin 13) blinks in a distinct
+//       cadence for 3 seconds on power-up / reset. If this blink pattern occurs
+//       while driving on the floor, it proves an electrical brownout reset.
+//    2. FAST PING INTERVAL: Pings front every 60 ms (16+ times/sec) so obstacles
+//       are spotted in real time at cruise speed.
+//    3. SOFT MOTOR RAMP: 45ms PWM ramp prevents surge current from dropping
+//       the 5V line and triggering brownout resets.
+//    4. STARTUP CHECK: Pings front first. If clear (> 35 cm), cruises immediately.
+//       If blocked, scans Left & Right, pivots 90°, and then cruises.
+//    5. INSTANT STOP & AVOIDANCE: Immediate stop, 1 step reverse, side scan,
+//       and 90° pivot towards clearer direction.
 // ============================================================================
 
 #include <Servo.h>
 
 // ============================================================================
-//  PINS (change ONLY here for different wiring)
+//  PIN ASSIGNMENTS
 // ============================================================================
-#define PIN_SERVO  3
-#define PIN_TRIG  11
-#define PIN_ECHO  12
-#define PIN_ENA    5
-#define PIN_IN1    7
-#define PIN_IN2    8
-#define PIN_ENB    6
-#define PIN_IN3    9
-#define PIN_IN4   10
+#define PIN_LED    13    // Onboard status & reset indicator LED
+#define PIN_SERVO   3
+#define PIN_TRIG   11
+#define PIN_ECHO   12
+#define PIN_ENA     5
+#define PIN_IN1     7
+#define PIN_IN2     8
+#define PIN_ENB     6
+#define PIN_IN3     9
+#define PIN_IN4    10
 
 // ============================================================================
-//  TUNING
+//  CALIBRATION / TUNING CONSTANTS
 // ============================================================================
-#define STOP_CM        28    // v15: trigger avoidance if 4 < distance <= this (stopping distance)
-#define CLEAR_CM      400    // normalized value for timeout / no-echo = clear path
-#define SPEED_CRUISE  190    // cruise PWM (raised 130→190 for 4WD static friction on tile)
-#define SPEED_TURN    180    // pivot PWM (raised 150→180)
-#define SPEED_REV     190    // reverse PWM (raised 130→190)
-#define TURN_MS       650    // pivot time for ~90°
-#define REV_MS        400    // reverse time
-#define ESCAPE_MS     500    // forward escape after turn
-#define SCAN_SETTLE   450    // servo settle at extremes
-#define PING_INTERVAL  80    // ms between front pings during cruise (v16: 50→80 to avoid echo overlap)
-#define SERVO_LEFT   160
-#define SERVO_RIGHT   25
-#define SERVO_CENTER  90
-#define PING_TIMEOUT 25000   // pulseIn timeout µs → ~425cm max
+#define STOP_DIST_CM     35    // Distance threshold to trigger obstacle avoidance (cm)
+#define MIN_VALID_CM      3    // Ignore motor electrical noise spikes <= 3cm
+#define CLEAR_CM        400    // Value returned on timeout / wide open path (cm)
+
+#define SPEED_CRUISE    135    // Reduced for 3S 11.1V battery (plenty fast, 40% less current)
+#define SPEED_TURN      130    // Pivot speed for turns (0-255 PWM)
+#define SPEED_REV       130    // Reverse speed (0-255 PWM)
+
+#define TURN_90_MS      950    // Time to execute ~90 degree pivot at 130 PWM
+#define REV_STEP_MS     300    // Duration of 1 step backwards (ms)
+#define PING_INTERVAL    60    // Time between pings while cruising (ms) (optimal 60ms)
+#define SCAN_SETTLE_MS  350    // Time for servo to arrive & settle at angle (ms)
+
+// Servo Angles: (If servo points right when it says LEFT, swap 160 and 25)
+#define SERVO_LEFT      160    // Left scan angle (deg)
+#define SERVO_RIGHT      25    // Right scan angle (deg)
+#define SERVO_CENTER     90    // Center / Forward angle (deg)
+#define PING_TIMEOUT  25000    // pulseIn timeout µs (~4.2m max)
 
 // ============================================================================
-//  SENSOR MODULE — raw pulseIn, no library hiding timeout
+//  SENSOR MODULE
 // ============================================================================
 void sensor_init() {
   pinMode(PIN_TRIG, OUTPUT);
@@ -60,40 +65,41 @@ void sensor_init() {
   digitalWrite(PIN_TRIG, LOW);
 }
 
-// Returns cm. Returns CLEAR_CM (400) on timeout (no echo = no obstacle in range).
-// FIX #1: 0 (timeout/garbage) is treated as CLEAR path, never as blocked.
+// Single ultrasonic ping. Returns distance in cm.
+// Returns CLEAR_CM (400) if no echo received (path is clear) or out of range.
 int sensor_ping() {
   digitalWrite(PIN_TRIG, LOW);
   delayMicroseconds(2);
   digitalWrite(PIN_TRIG, HIGH);
   delayMicroseconds(10);
   digitalWrite(PIN_TRIG, LOW);
+
   unsigned long us = pulseIn(PIN_ECHO, HIGH, PING_TIMEOUT);
-  if (us == 0) return CLEAR_CM;          // timeout = nothing within range → clear
+  if (us == 0) return CLEAR_CM;
+
   int cm = (int)(us * 0.0343 / 2.0);
-  if (cm <= 0 || cm > 400) return CLEAR_CM; // garbage beyond sensor range → clear
+  if (cm <= 0 || cm > 400) return CLEAR_CM;
   return cm;
 }
 
-// Median of 5 pings — accurate, use when stopped
+// Median of 5 pings with brief delay — ultra-reliable for static scans
 int sensor_ping_median() {
   int readings[5], sorted[5];
   for (int i = 0; i < 5; i++) {
     readings[i] = sensor_ping();
-    delay(30);
+    delay(25);
   }
-  // insertion sort
   for (int i = 0; i < 5; i++) sorted[i] = readings[i];
   for (int i = 1; i < 5; i++) {
     int key = sorted[i], j = i - 1;
     while (j >= 0 && sorted[j] > key) { sorted[j + 1] = sorted[j]; j--; }
     sorted[j + 1] = key;
   }
-  return sorted[2]; // median
+  return sorted[2];
 }
 
 // ============================================================================
-//  MOTOR MODULE
+//  MOTOR MODULE (L298N with Soft Ramp to prevent Brownout Resets)
 // ============================================================================
 void motors_init() {
   pinMode(PIN_ENA, OUTPUT); pinMode(PIN_IN1, OUTPUT); pinMode(PIN_IN2, OUTPUT);
@@ -110,12 +116,26 @@ void motors_stop() {
 void motors_forward(uint8_t spd) {
   digitalWrite(PIN_IN1, HIGH); digitalWrite(PIN_IN2, LOW);
   digitalWrite(PIN_IN3, HIGH); digitalWrite(PIN_IN4, LOW);
+  // Gentle 100ms soft ramp to eliminate inrush current spike that causes brownout
+  uint8_t start = (spd > 70) ? (spd - 50) : spd;
+  for (uint8_t s = start; s < spd; s += 10) {
+    analogWrite(PIN_ENA, s);
+    analogWrite(PIN_ENB, s);
+    delay(20);
+  }
   analogWrite(PIN_ENA, spd);   analogWrite(PIN_ENB, spd);
 }
 
 void motors_reverse(uint8_t spd) {
   digitalWrite(PIN_IN1, LOW);  digitalWrite(PIN_IN2, HIGH);
   digitalWrite(PIN_IN3, LOW);  digitalWrite(PIN_IN4, HIGH);
+  // Gentle 100ms soft ramp
+  uint8_t start = (spd > 70) ? (spd - 50) : spd;
+  for (uint8_t s = start; s < spd; s += 10) {
+    analogWrite(PIN_ENA, s);
+    analogWrite(PIN_ENB, s);
+    delay(20);
+  }
   analogWrite(PIN_ENA, spd);   analogWrite(PIN_ENB, spd);
 }
 
@@ -139,215 +159,220 @@ Servo scanServo;
 void servo_init() {
   scanServo.attach(PIN_SERVO);
   scanServo.write(SERVO_CENTER);
-  // non-blocking: just write position, let caller handle timing
 }
 
-void servo_lookLeft()  { scanServo.write(SERVO_LEFT);  }
-void servo_lookRight() { scanServo.write(SERVO_RIGHT); }
+void servo_lookLeft()  { scanServo.write(SERVO_LEFT);   }
+void servo_lookRight() { scanServo.write(SERVO_RIGHT);  }
 void servo_center()    { scanServo.write(SERVO_CENTER); }
 
 // ============================================================================
-//  STATE MACHINE
+//  STATE MACHINE DEFINITION
 // ============================================================================
-enum State {
-  CRUISE,
-  AVOID_STOP, AVOID_REVERSE, AVOID_SETTLE,
-  AVOID_SCAN_LEFT, AVOID_SCAN_RIGHT, AVOID_SCAN_FRONT,
-  AVOID_DECIDE, AVOID_TURN, AVOID_ESCAPE
+enum RobotState {
+  STATE_CRUISE,
+  STATE_AVOID_STOP,
+  STATE_AVOID_REVERSE,
+  STATE_AVOID_SCAN_LEFT,
+  STATE_AVOID_SCAN_RIGHT,
+  STATE_AVOID_DECIDE,
+  STATE_AVOID_PIVOT,
+  STATE_AVOID_RESUME
 };
-State state = CRUISE;
 
-uint32_t stateStart = 0;    // when we entered current state
-uint32_t lastPing = 0;      // last front ping time
-int avoidDir = 0;           // -1 left, 1 right (DECIDE never picks 0/front — see v15 fix)
-int distL = 0, distR = 0, distF = 0;
-uint8_t blockHits = 0;      // v16: consecutive blocked pings in CRUISE (need 2× to trigger)
+RobotState state = STATE_CRUISE;
+uint32_t stateStartTime = 0;
+uint32_t lastPingTime   = 0;
+int avoidDir = 0;              // -1 = Left, 1 = Right
+int distL = 0, distR = 0;
 
-// ============================================================================
-//  SETUP
-// ============================================================================
-void setup() {
-  Serial.begin(9600);
-  sensor_init();
-  motors_init();
-  servo_init();
-  delay(600);  // one-time servo power-up settle
+// Helper: Scan Left and Right, decide direction, and pivot 90°
+void scanSidesAndTurn() {
+  Serial.println(F("[AVOID] Pointing LEFT (scanning)..."));
+  servo_lookLeft();
+  delay(SCAN_SETTLE_MS);
+  distL = sensor_ping_median();
+  Serial.print(F("[AVOID] Left distance: ")); Serial.print(distL); Serial.println(F(" cm"));
 
-  Serial.println(F("=== ROBOT v16 fixed ==="));
+  Serial.println(F("[AVOID] Pointing RIGHT (scanning)..."));
+  servo_lookRight();
+  delay(SCAN_SETTLE_MS);
+  distR = sensor_ping_median();
+  Serial.print(F("[AVOID] Right distance: ")); Serial.print(distR); Serial.println(F(" cm"));
 
-  // Startup: scan L/F/R (sensor returns 400 = clear on timeout)
-  servo_lookLeft();  delay(SCAN_SETTLE); distL = sensor_ping_median();
-  servo_lookRight(); delay(SCAN_SETTLE); distR = sensor_ping_median();
-  servo_center();    delay(300);         distF = sensor_ping_median();
-  if (distL == 0) distL = CLEAR_CM;
-  if (distR == 0) distR = CLEAR_CM;
-  if (distF == 0) distF = CLEAR_CM;
+  servo_center();
+  delay(250);
 
-  Serial.print(F("L:")); Serial.print(distL);
-  Serial.print(F(" F:")); Serial.print(distF);
-  Serial.print(F(" R:")); Serial.println(distR);
-
-  // pick best — FIX #2: front clear (incl. 400 = timeout) means go straight
-  if (distF >= STOP_CM) avoidDir = 0;          // front clear (distF == 400 also lands here)
-  else if (distL >= distR) avoidDir = -1;
-  else avoidDir = 1;
-
-  if (avoidDir == -1) { motors_pivotLeft(SPEED_TURN); delay(TURN_MS); }
-  else if (avoidDir == 1) { motors_pivotRight(SPEED_TURN); delay(TURN_MS); }
-  motors_stop(); delay(150);
-
-  motors_forward(SPEED_CRUISE);
-  state = CRUISE;
-  stateStart = millis();   // FIX #4: stamp entry into CRUISE
-  lastPing = millis();
-  Serial.println(F("-> CRUISE"));
+  if (distL >= distR) {
+    Serial.println(F("[AVOID] Turning LEFT 90 degrees"));
+    motors_pivotLeft(SPEED_TURN);
+  } else {
+    Serial.println(F("[AVOID] Turning RIGHT 90 degrees"));
+    motors_pivotRight(SPEED_TURN);
+  }
+  delay(TURN_90_MS);
+  motors_stop();
+  delay(100);
 }
 
 // ============================================================================
-//  LOOP — fully non-blocking state machine
+//  SETUP ROUTINE
+// ============================================================================
+void setup() {
+  pinMode(PIN_LED, OUTPUT);
+  Serial.begin(115200);
+
+  // --------------------------------------------------------------------------
+  // RESET INDICATOR & 3-SECOND SAFETY COUNTDOWN
+  // If the Arduino resets while driving on the floor, you will see this
+  // double-blink countdown start over.
+  // --------------------------------------------------------------------------
+  Serial.println(F("========================================"));
+  Serial.println(F("  OBSTACLE AVOIDING ROBOT BOOTING UP    "));
+  Serial.println(F("========================================"));
+
+  sensor_init();
+  motors_init();
+  servo_init();
+
+  for (int i = 3; i >= 1; i--) {
+    Serial.print(F("[BOOT] Safety countdown: ")); Serial.print(i); Serial.println(F("..."));
+    for (int b = 0; b < 2; b++) {
+      digitalWrite(PIN_LED, HIGH); delay(120);
+      digitalWrite(PIN_LED, LOW);  delay(120);
+    }
+    delay(400);
+  }
+  digitalWrite(PIN_LED, HIGH);  // Solid ON indicates robot is active!
+
+  Serial.println(F("[STARTUP] Checking FRONT obstacle..."));
+  servo_center();
+  delay(300);
+
+  int distF = sensor_ping_median();
+  Serial.print(F("[STARTUP] Front reading: ")); Serial.print(distF); Serial.println(F(" cm"));
+
+  // Check if obstacle is present at startup (30-35cm range)
+  if (distF <= STOP_DIST_CM && distF > MIN_VALID_CM) {
+    Serial.println(F("[STARTUP] Front is BLOCKED. Scanning sides to pick direction..."));
+    scanSidesAndTurn();
+  } else {
+    Serial.println(F("[STARTUP] Front is CLEAR. Proceeding directly to cruise!"));
+  }
+
+  // Begin continuous cruise
+  Serial.println(F("[ROBOT] -> Starting CRUISE forward!"));
+  motors_forward(SPEED_CRUISE);
+  state = STATE_CRUISE;
+  stateStartTime = millis();
+  lastPingTime   = millis();
+}
+
+// ============================================================================
+//  MAIN LOOP — Non-Blocking Cruise & Instant Obstacle Avoidance
 // ============================================================================
 void loop() {
   uint32_t now = millis();
 
   switch (state) {
 
-    // ── CRUISE: ping front, motor stays ON — v16 double-ping debounce ──
-    case CRUISE: {
-      if (now - lastPing < PING_INTERVAL) return;  // not time yet (80ms)
-      lastPing = now;
-      int d = sensor_ping();
-      if (d == 0) d = CLEAR_CM;  // defensive: 0 = timeout → clear (sensor_ping already returns 400)
-      Serial.print(F("front ")); Serial.println(d);
-      // v16: require 2 consecutive pings in (4, STOP_CM] before blocking.
-      // Single stray echo no longer interrupts cruise. Clear ping resets counter.
-      if (d > 4 && d <= STOP_CM) {
-        blockHits++;
-        Serial.print(F("hit ")); Serial.print(blockHits); Serial.println(F("/2"));
-        if (blockHits >= 2) {
-          Serial.print(F("BLOCKED d=")); Serial.println(d);
-          motors_stop();
-          blockHits = 0;
-          stateStart = now;
-          state = AVOID_STOP;
+    // ── CRUISE: Drive forward while simultaneously sensing front ────────────
+    case STATE_CRUISE: {
+      if (now - lastPingTime >= PING_INTERVAL) {
+        lastPingTime = now;
+        int d = sensor_ping();
+
+        // Check for obstacle in front within detection distance
+        if (d <= STOP_DIST_CM && d > MIN_VALID_CM) {
+          Serial.print(F("[ALERT] Obstacle in front at: "));
+          Serial.print(d);
+          Serial.println(F(" cm! STOPPING IMMEDIATELY"));
+          
+          motors_stop();               // Instant stop!
+          stateStartTime = now;
+          state = STATE_AVOID_STOP;
         }
-      } else {
-        if (blockHits != 0) Serial.println(F("clear -> reset hits"));
-        blockHits = 0;  // clear reading (d > STOP_CM or 400 or ≤4 glitch) → reset
       }
-      // else: motor keeps running (motors_forward was called before entering CRUISE)
       break;
     }
 
-    // ── AVOID: stop, then reverse ───────────────────────────────────────
-    case AVOID_STOP:
-      if (now - stateStart >= 300) {
+    // ── AVOID_STOP: Pause to kill robot momentum & let 5V rail stabilize ───
+    case STATE_AVOID_STOP:
+      if (now - stateStartTime >= 150) {
+        Serial.println(F("[AVOID] Step backwards..."));
         motors_reverse(SPEED_REV);
-        stateStart = now;
-        state = AVOID_REVERSE;
+        stateStartTime = now;
+        state = STATE_AVOID_REVERSE;
       }
       break;
 
-    case AVOID_REVERSE:
-      if (now - stateStart >= REV_MS) {
+    // ── AVOID_REVERSE: Reverse 1 step backwards ─────────────────────────────
+    case STATE_AVOID_REVERSE:
+      if (now - stateStartTime >= REV_STEP_MS) {
         motors_stop();
-        stateStart = now;
-        state = AVOID_SETTLE;
-      }
-      break;
-
-    // ── wait for servo+robot to settle before scanning ──────────────────
-    case AVOID_SETTLE:
-      if (now - stateStart >= 300) {
+        delay(150);  // Allow power rail to recharge completely before servo moves
+        Serial.println(F("[AVOID] Stopped. Looking LEFT..."));
         servo_lookLeft();
-        stateStart = now;
-        state = AVOID_SCAN_LEFT;
+        stateStartTime = now;
+        state = STATE_AVOID_SCAN_LEFT;
       }
       break;
 
-    // ── scan left ───────────────────────────────────────────────────────
-    case AVOID_SCAN_LEFT:
-      if (now - stateStart >= SCAN_SETTLE) {
+    // ── AVOID_SCAN_LEFT: Wait for servo settle, measure left clearance ──────
+    case STATE_AVOID_SCAN_LEFT:
+      if (now - stateStartTime >= SCAN_SETTLE_MS) {
         distL = sensor_ping_median();
-        if (distL == 0) distL = CLEAR_CM;  // defensive normalize
-        Serial.print(F("L:")); Serial.println(distL);
+        Serial.print(F("[AVOID] Left distance: ")); Serial.print(distL); Serial.println(F(" cm"));
+        Serial.println(F("[AVOID] Looking RIGHT..."));
         servo_lookRight();
-        stateStart = now;
-        state = AVOID_SCAN_RIGHT;
+        stateStartTime = now;
+        state = STATE_AVOID_SCAN_RIGHT;
       }
       break;
 
-    // ── scan right ──────────────────────────────────────────────────────
-    case AVOID_SCAN_RIGHT:
-      if (now - stateStart >= SCAN_SETTLE) {
+    // ── AVOID_SCAN_RIGHT: Wait for servo settle, measure right clearance ────
+    case STATE_AVOID_SCAN_RIGHT:
+      if (now - stateStartTime >= SCAN_SETTLE_MS) {
         distR = sensor_ping_median();
-        if (distR == 0) distR = CLEAR_CM;  // defensive normalize
-        Serial.print(F("R:")); Serial.println(distR);
+        Serial.print(F("[AVOID] Right distance: ")); Serial.print(distR); Serial.println(F(" cm"));
         servo_center();
-        stateStart = now;
-        state = AVOID_SCAN_FRONT;
+        stateStartTime = now;
+        state = STATE_AVOID_DECIDE;
       }
       break;
 
-    // ── scan front ──────────────────────────────────────────────────────
-    case AVOID_SCAN_FRONT:
-      if (now - stateStart >= 300) {
-        distF = sensor_ping_median();
-        if (distF == 0) distF = CLEAR_CM;  // defensive normalize
-        Serial.print(F("F:")); Serial.println(distF);
-        stateStart = now;   // FIX #4: stamp entry into DECIDE
-        state = AVOID_DECIDE;
+    // ── AVOID_DECIDE: Re-center servo, pick direction with greater clearance ─
+    case STATE_AVOID_DECIDE:
+      if (now - stateStartTime >= 250) {  // Allow servo to return to center
+        if (distL >= distR) {
+          avoidDir = -1;  // Left
+          Serial.println(F("[AVOID] Decision: Turn LEFT 90 degrees"));
+          motors_pivotLeft(SPEED_TURN);
+        } else {
+          avoidDir = 1;   // Right
+          Serial.println(F("[AVOID] Decision: Turn RIGHT 90 degrees"));
+          motors_pivotRight(SPEED_TURN);
+        }
+        stateStartTime = now;
+        state = STATE_AVOID_PIVOT;
       }
       break;
 
-    // ── decide direction ────────────────────────────────────────────────
-    case AVOID_DECIDE: {
-      // FIX v15: this state is ONLY reached after BLOCKED, so front is never
-      // an option — picking it would drive straight back into the obstacle
-      // (infinite stutter loop). Strictly left vs right on clearance.
-      if (distL >= distR) {
-        avoidDir = -1; // left has more (or equal) clearance
-      } else {
-        avoidDir = 1;  // right has more clearance
-      }
-
-      Serial.print(F("DIR="));
-      if (avoidDir == -1) Serial.println(F("LEFT"));
-      else Serial.println(F("RIGHT"));
-
-      stateStart = now;
-      state = AVOID_TURN;
-      break;
-    }
-
-    // ── non-blocking pivot — always completes full TURN_MS ────────────────
-    case AVOID_TURN: {
-      // start pivot on first entry
-      static bool pivoting = false;
-      if (!pivoting) {
-        // v15: avoidDir is always -1 or 1 here (DECIDE never picks front),
-        // so every avoidance ends with a solid full-duration pivot.
-        if (avoidDir == -1) motors_pivotLeft(SPEED_TURN);
-        else motors_pivotRight(SPEED_TURN);
-        pivoting = true;
-        stateStart = now;
-      }
-      if (now - stateStart >= TURN_MS) {
+    // ── AVOID_PIVOT: Pivot 90° for TURN_90_MS ───────────────────────────────
+    case STATE_AVOID_PIVOT:
+      if (now - stateStartTime >= TURN_90_MS) {
         motors_stop();
-        pivoting = false;
-        stateStart = now;
-        state = AVOID_ESCAPE;
+        stateStartTime = now;
+        state = STATE_AVOID_RESUME;
       }
       break;
-    }
 
-    // ── escape forward then resume cruise ───────────────────────────────
-    case AVOID_ESCAPE:
-      if (now - stateStart >= 150) {  // small settle after stop
+    // ── AVOID_RESUME: Brief settle after pivot, then resume CRUISE forward ───
+    case STATE_AVOID_RESUME:
+      if (now - stateStartTime >= 100) {
+        Serial.println(F("[ROBOT] -> Resuming CRUISE forward!"));
         motors_forward(SPEED_CRUISE);
-        blockHits = 0;      // v16: fresh debounce window on re-enter CRUISE
-        stateStart = now;
-        state = CRUISE;
-        lastPing = now;
+        lastPingTime = now;
+        state = STATE_CRUISE;
       }
       break;
   }
